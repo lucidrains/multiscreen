@@ -1,9 +1,12 @@
 from __future__ import annotations
+from math import log
 
 import torch
+from torch import nn
 import torch.nn.functional as F
-from torch.nn import Module, Linear, ModuleList
+from torch.nn import Module, ModuleList, Linear
 
+import einx
 from einops import einsum
 from einops.layers.torch import Rearrange
 
@@ -26,9 +29,29 @@ def tanh_norm(t):
     norm = t.norm(dim = -1, keepdim = True)
     return norm.tanh() * l2norm(t)
 
+# learned scales
+
+class LearnedScale(Module):
+    def __init__(
+        self,
+        dim = 1,
+        init_value = 1e-10,
+        rearrange_eq = None
+    ):
+        super().__init__()
+        self.rearrange = Rearrange(rearrange_eq) if exists(rearrange_eq) else nn.Identity()
+
+        log_init_value = log(init_value)
+        self.log_scales = nn.Parameter(torch.ones(dim) * log_init_value)
+
+    def forward(self, t):
+        scale = self.log_scales.exp()
+        scale = self.rearrange(scale)
+        return t * scale
+
 # classes
 
-class MultiScreen(Module):
+class GatedScreeningTile(Module):
     def __init__(
         self,
         dim,
@@ -53,6 +76,7 @@ class MultiScreen(Module):
 
         # merging of heads and projecting out
 
+        self.head_wise_scale = LearnedScale(heads, rearrange_eq = 'h -> h 1 1')
         self.to_out = Linear(dim_values * heads, dim, bias = False)
 
         # split and merging of heads
@@ -91,6 +115,11 @@ class MultiScreen(Module):
 
         sim = einsum(queries, keys, 'b h i d, b h j d -> b h i j')
 
+        # maybe mask
+
+        if exists(mask):
+            sim = einx.where('b j, b h i j,', mask, sim, 0.)
+
         # relu squared, sans the screening / filtering
 
         attn = F.relu(sim) ** 2
@@ -107,8 +136,26 @@ class MultiScreen(Module):
 
         out = normed_aggr_values * F.silu(gates).tanh()
 
+        # author applies headwise scaling, from an old google brain paper iirc
+
+        out = self.head_wise_scale(out)
+
         # merging and project, sans headwise scaling
 
         out = self.merge_heads(out)
 
         return self.to_out(out)
+
+# multiscreen
+
+class MultiScreen(Module):
+    def __init__(
+        self,
+        dim,
+        depth = 6,
+        **kwargs
+    ):
+        super().__init__()
+
+    def forward(self, token_ids):
+        return token_ids

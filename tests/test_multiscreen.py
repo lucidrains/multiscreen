@@ -6,15 +6,18 @@ param = pytest.mark.parametrize
 def test_multiscreen(
     cross_attend
 ):
-    from multiscreen.multiscreen import MultiScreen
+    from multiscreen.multiscreen import GatedScreeningTile
 
-    model = MultiScreen(512)
+    model = GatedScreeningTile(512)
 
     tokens = torch.randn(1, 1024, 512)
 
-    context = None
+    context = context_mask = None
 
     if cross_attend:
         context = torch.randn(1, 2048, 512)
+        context_mask = torch.randint(0, 2, (1, 2048)).bool()
 
-    assert model(tokens, context = context).shape == tokens.shape
+    out = model(tokens, context = context, mask = context_mask)
+
+    assert out.shape == tokens.shape
