@@ -1,3 +1,5 @@
+<img src="./multiscreen.png" width="400px"></img>
+
 ## MultiScreen
 
 Implementation of Multiscreen proposed by Ken Nakanishi for [Screening is Enough](https://arxiv.org/abs/2604.01178)
