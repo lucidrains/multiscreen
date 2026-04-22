@@ -42,12 +42,14 @@ class MultiScreen(Module):
 
         # queries, keys, values
 
-        dim_key_values = (dim_keys, dim_values)
+        dim_key_value = (dim_keys, dim_values)
 
-        self.to_queries = Linear(dim, dim_keys * heads, bias = False)
-        self.to_keys_values = Linear(dim_context, sum(dim_key_values) * heads, bias = False)
+        dim_inner = sum(dim_key_value) * heads
 
-        self.dim_key_values = dim_key_values
+        self.to_queries_gates = Linear(dim, dim_inner, bias = False)
+        self.to_keys_values = Linear(dim_context, dim_inner, bias = False)
+
+        self.dim_key_value = dim_key_value
 
         # merging of heads and projecting out
 
@@ -70,13 +72,16 @@ class MultiScreen(Module):
 
         # queries, keys, values
 
-        queries = self.to_queries(tokens)
+        queries_gates = self.to_queries_gates(tokens)
 
         keys_values = self.to_keys_values(key_value_input)
 
-        queries, keys_values = map(self.split_heads, (queries, keys_values))
+        queries_gates, keys_values = map(self.split_heads, (queries_gates, keys_values))
 
-        keys, values = keys_values.split(self.dim_key_values, dim = -1)
+        # break out the queries, keys, values, gates
+
+        queries, gates = queries_gates.split(self.dim_key_value, dim = -1)
+        keys, values = keys_values.split(self.dim_key_value, dim = -1)
 
         # aggressive normalization
 
@@ -92,11 +97,15 @@ class MultiScreen(Module):
 
         # aggregate
 
-        out = einsum(attn, values, 'b h i j, b h j d -> b h i d')
+        aggr_values = einsum(attn, values, 'b h i j, b h j d -> b h i d')
 
         # add the proposed tanh norm for further stability
 
-        out = tanh_norm(out)
+        normed_aggr_values = tanh_norm(aggr_values)
+
+        # gate (24)
+
+        out = normed_aggr_values * F.silu(gates).tanh()
 
         # merging and project, sans headwise scaling
 
