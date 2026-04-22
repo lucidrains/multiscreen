@@ -33,7 +33,6 @@ def orthog_project(x, y):
         x, y = x.double(), y.double()
 
     unit = l2norm(y)
-
     parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
     orthog = x - parallel
 
@@ -82,10 +81,15 @@ class GatedScreeningTile(Module):
         heads = 8,
         dim_context = None,
         dim_keys = 16,
-        dim_values = 64
+        dim_values = 64,
+        causal = True
     ):
         super().__init__()
         dim_context = default(dim_context, dim)
+
+        # autoregressive or not
+
+        self.causal = causal
 
         # queries, keys, values
 
@@ -157,6 +161,11 @@ class GatedScreeningTile(Module):
 
         if exists(mask):
             sim = einx.where('b j, b h i j,', mask, sim, 0.)
+
+        if self.causal:
+            i, j = sim.shape[-2:]
+            causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
+            sim = sim.masked_fill(causal_mask, 0.)
 
         # aggregate
 

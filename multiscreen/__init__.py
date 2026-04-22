@@ -1,1 +1,4 @@
-from multiscreen.multiscreen import GatedScreeningTile, MultiScreen
+from multiscreen.multiscreen import (
+    GatedScreeningTile,
+    MultiScreen
+)

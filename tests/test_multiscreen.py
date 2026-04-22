@@ -8,7 +8,7 @@ def test_tile(
 ):
     from multiscreen.multiscreen import GatedScreeningTile
 
-    model = GatedScreeningTile(512)
+    model = GatedScreeningTile(512, causal = not cross_attend)
 
     tokens = torch.randn(1, 1024, 512)
 
