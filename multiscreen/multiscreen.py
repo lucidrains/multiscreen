@@ -10,6 +10,8 @@ import einx
 from einops import einsum
 from einops.layers.torch import Rearrange
 
+from PoPE_pytorch import PoPE
+
 # functions
 
 def exists(v):
@@ -82,10 +84,19 @@ class GatedScreeningTile(Module):
         dim_context = None,
         dim_keys = 16,
         dim_values = 64,
+        use_pope = True,
+        dim_pope = 4,
         causal = True
     ):
         super().__init__()
         dim_context = default(dim_context, dim)
+
+        # relative positions
+        # author overly concerned with length extrap, seems unaware of recent work https://arxiv.org/abs/2509.10534
+        # we will just use partial PoPE here
+
+        assert dim_pope <= dim_keys
+        self.pope = PoPE(dim = dim_pope, heads = heads) if exists(use_pope) else None
 
         # autoregressive or not
 
@@ -126,6 +137,12 @@ class GatedScreeningTile(Module):
 
         key_value_input = default(context, tokens)
 
+        # maybe pope
+
+        if exists(self.pope):
+            seq_len = max((key_value_input.shape[-2], tokens.shape[-2]))
+            pos_emb = self.pope(seq_len)
+
         # queries, keys, values
 
         queries_gates = self.to_queries_gates(tokens)
@@ -142,6 +159,11 @@ class GatedScreeningTile(Module):
         # aggressive normalization
 
         queries, keys, values = map(l2norm, (queries, keys, values)) # l2norm for queries, keys, and values
+
+        # maybe rotate
+
+        if exists(self.pope):
+            queries, keys = self.pope.apply_pope_to_qk(pos_emb, queries, keys)
 
         # cosine similarity
 
