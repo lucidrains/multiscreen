@@ -23,6 +23,22 @@ def default(v, d):
 def l2norm(t):
     return F.normalize(t, p = 2, dim = -1)
 
+# orthogonal residual updates
+# https://arxiv.org/abs/2505.11881
+
+def orthog_project(x, y):
+    dtype = x.dtype
+
+    if x.device.type != 'mps':
+        x, y = x.double(), y.double()
+
+    unit = l2norm(y)
+
+    parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
+    orthog = x - parallel
+
+    return orthog.to(dtype)
+
 # proposed tanh norm
 
 def tanh_norm(t):
@@ -170,17 +186,27 @@ class MultiScreen(Module):
 
     def forward(self, token_ids):
 
+        # embed
+
         normed_token_embeds = l2norm(self.token_embeds)
         tokens = normed_token_embeds[token_ids]
 
         tokens = self.scale_embed(tokens)
 
+        # deep learning
+
         for layer in self.layers:
-            tokens = layer(tokens) + tokens
+            residual = tokens
+            block_out = layer(tokens)
+            tokens = tokens + orthog_project(block_out, residual)
+
+        # norm
 
         tokens = l2norm(tokens)
-        tokens = self.scale_unembed(tokens)
 
+        # unembed
+
+        tokens = self.scale_unembed(tokens)
         logits = einsum(tokens, normed_token_embeds, 'b n d, l d -> b n l')
 
         return logits
