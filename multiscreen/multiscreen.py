@@ -52,6 +52,7 @@ class LearnedScale(Module):
         self,
         dim = 1,
         init_value = 1.,
+        bias = 0.,
         rearrange_eq = None
     ):
         super().__init__()
@@ -60,9 +61,16 @@ class LearnedScale(Module):
         log_init_value = log(init_value)
         self.log_scales = nn.Parameter(torch.ones(dim) * log_init_value)
 
-    def forward(self, t):
+        self.bias = bias
+
+    def forward(self, t = None):
         scale = self.log_scales.exp()
-        scale = self.rearrange(scale)
+
+        scale = self.rearrange(scale) + self.bias
+
+        if not exists(t):
+            return scale
+
         return t * scale
 
 # classes
@@ -92,8 +100,12 @@ class GatedScreeningTile(Module):
 
         # merging of heads and projecting out
 
-        self.head_wise_scale = LearnedScale(heads, rearrange_eq = 'h -> h 1 1')
         self.to_out = Linear(dim_values * heads, dim, bias = False)
+
+        # learned parameters for screening and headwise scale at end
+
+        self.inverse_acceptance_width = LearnedScale(heads, bias = 1., rearrange_eq = 'h -> h 1 1') # r in paper, as r increases, you filter / screen out less
+        self.head_wise_scale = LearnedScale(heads, rearrange_eq = 'h -> h 1 1')
 
         # split and merging of heads
 
@@ -131,14 +143,20 @@ class GatedScreeningTile(Module):
 
         sim = einsum(queries, keys, 'b h i d, b h j d -> b h i j')
 
+        # content screening
+
+        r = acceptance_width = 1. / self.inverse_acceptance_width()
+
+        screened_sim = 1. - r * (1. - sim) # eq (16)
+
+        # relu squared
+
+        attn = F.relu(screened_sim) ** 2
+
         # maybe mask
 
         if exists(mask):
             sim = einx.where('b j, b h i j,', mask, sim, 0.)
-
-        # relu squared, sans the screening / filtering
-
-        attn = F.relu(sim) ** 2
 
         # aggregate
 
