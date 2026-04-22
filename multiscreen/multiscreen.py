@@ -254,7 +254,7 @@ class GatedScreeningTile(Module):
 
         out = self.head_wise_scale(out)
 
-        # merging and project, sans headwise scaling
+        # merging and project
 
         out = self.merge_heads(out)
 
