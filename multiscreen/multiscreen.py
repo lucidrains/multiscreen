@@ -228,15 +228,15 @@ class GatedScreeningTile(Module):
         # maybe mask
 
         if exists(mask):
-            sim = einx.where('b j, b h i j,', mask, sim, 0.)
+            attn = einx.where('b j, b h i j,', mask, attn, 0.)
 
         if self.soft_mask:
-            sim = self.soft_mask(sim)
+            attn = self.soft_mask(attn)
 
         elif self.causal:
-            i, j = sim.shape[-2:]
+            i, j = attn.shape[-2:]
             causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
-            sim = sim.masked_fill(causal_mask, 0.)
+            attn = attn.masked_fill(causal_mask, 0.)
 
         # aggregate
 
