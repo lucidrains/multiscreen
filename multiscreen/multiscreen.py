@@ -2,7 +2,7 @@ from __future__ import annotations
 from math import log
 
 import torch
-from torch import nn
+from torch import nn, pi, arange
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear
 
@@ -74,6 +74,45 @@ class LearnedScale(Module):
 
         return t * scale
 
+# distance aware soft mask
+
+class SoftMask(Module):
+    def __init__(
+        self,
+        heads
+    ):
+        super().__init__()
+        self.learned_window = LearnedScale(heads, bias = 1., rearrange_eq = 'h -> h 1 1')
+
+    def forward(
+        self,
+        sim
+    ):
+        i, j, device = *sim.shape[2:], sim.device
+        offset = j - i
+
+        assert i <= j
+
+        # learned window
+
+        w = self.learned_window()
+
+        # get distance
+
+        seq_i, seq_j = tuple(arange(n, dtype = torch.float, device = device) for n in (i, j))
+
+        distance = einx.subtract('j, i -> i j', seq_j, seq_i + offset)
+
+        # eq (17)
+
+        soft_mask = torch.where(
+            (distance <= 0.) & (distance > -w),
+            0.5 * (torch.cos((distance * pi) / w) + 1.),
+            0.
+        )
+
+        return sim * soft_mask
+
 # classes
 
 class GatedScreeningTile(Module):
@@ -86,7 +125,8 @@ class GatedScreeningTile(Module):
         dim_values = 64,
         use_pope = True,
         dim_pope = 4,
-        causal = True
+        causal = True,
+        distance_aware_soft_mask = True
     ):
         super().__init__()
         dim_context = default(dim_context, dim)
@@ -97,6 +137,10 @@ class GatedScreeningTile(Module):
 
         assert dim_pope <= dim_keys
         self.pope = PoPE(dim = dim_pope, heads = heads) if exists(use_pope) else None
+
+        # distance aware soft mask
+
+        self.soft_mask = SoftMask(heads) if distance_aware_soft_mask else None
 
         # autoregressive or not
 
@@ -171,7 +215,9 @@ class GatedScreeningTile(Module):
 
         # content screening
 
-        r = acceptance_width = 1. / self.inverse_acceptance_width()
+        # in the paper, r >= 1 and 1/r is the acceptance width.
+
+        r = self.inverse_acceptance_width()
 
         screened_sim = 1. - r * (1. - sim) # eq (16)
 
@@ -184,7 +230,10 @@ class GatedScreeningTile(Module):
         if exists(mask):
             sim = einx.where('b j, b h i j,', mask, sim, 0.)
 
-        if self.causal:
+        if self.soft_mask:
+            sim = self.soft_mask(sim)
+
+        elif self.causal:
             i, j = sim.shape[-2:]
             causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
             sim = sim.masked_fill(causal_mask, 0.)
