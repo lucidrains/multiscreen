@@ -35,7 +35,7 @@ class LearnedScale(Module):
     def __init__(
         self,
         dim = 1,
-        init_value = 1e-10,
+        init_value = 1.,
         rearrange_eq = None
     ):
         super().__init__()
@@ -151,11 +151,36 @@ class GatedScreeningTile(Module):
 class MultiScreen(Module):
     def __init__(
         self,
+        *,
+        num_tokens,
         dim,
         depth = 6,
         **kwargs
     ):
         super().__init__()
 
+        self.token_embeds = nn.Parameter(torch.randn(num_tokens, dim) * 1e-2)
+
+        self.scale_embed = LearnedScale()
+        self.scale_unembed = LearnedScale()
+
+        # gated screens
+
+        self.layers = ModuleList([GatedScreeningTile(dim = dim, **kwargs) for _ in range(depth)])
+
     def forward(self, token_ids):
-        return token_ids
+
+        normed_token_embeds = l2norm(self.token_embeds)
+        tokens = normed_token_embeds[token_ids]
+
+        tokens = self.scale_embed(tokens)
+
+        for layer in self.layers:
+            tokens = layer(tokens) + tokens
+
+        tokens = l2norm(tokens)
+        tokens = self.scale_unembed(tokens)
+
+        logits = einsum(tokens, normed_token_embeds, 'b n d, l d -> b n l')
+
+        return logits
