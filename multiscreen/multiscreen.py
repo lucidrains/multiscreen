@@ -213,15 +213,17 @@ class GatedScreeningTile(Module):
 
     @torch.no_grad()
     def init_(self):
-        q_w, g_w = self.to_queries_gates.weight.view(self.heads, self.dim_keys + self.dim_values, -1).split([self.dim_keys, self.dim_values], dim = 1)
-        init_normal_(q_w)
-        nn.init.normal_(g_w, std = 0.1)
+        heads, dim_key_value = self.heads, self.dim_key_value
 
-        k_w, v_w = self.to_keys_values.weight.view(self.heads, self.dim_keys + self.dim_values, -1).split([self.dim_keys, self.dim_values], dim = 1)
+        q_w, g_w = self.to_queries_gates.weight.view(heads, sum(dim_key_value), -1).split(dim_key_value, dim = 1)
+        k_w, v_w = self.to_keys_values.weight.view(heads, sum(dim_key_value), -1).split(dim_key_value, dim = 1)
+
+        init_normal_(q_w)
         init_normal_(k_w)
         init_normal_(v_w)
-
         init_normal_(self.to_out.weight)
+
+        nn.init.normal_(g_w, std = 0.1)
 
         if exists(self.soft_mask):
             self.soft_mask.init_()
@@ -391,7 +393,7 @@ class MultiScreen(Module):
 
         if return_loss:
             token_ids, labels = token_ids[..., :-1], token_ids[..., 1:]
-        
+
         # embed
 
         normed_token_embeds = l2norm(self.token_embeds)
