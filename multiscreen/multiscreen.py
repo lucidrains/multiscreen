@@ -1,5 +1,7 @@
 from __future__ import annotations
 from typing import Callable
+
+from functools import partial
 from math import log, ceil
 
 import torch
@@ -22,6 +24,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def identity(t):
+    return t
 
 def inv_sqrt(x):
     return x ** -0.5
@@ -178,7 +183,9 @@ class GatedScreeningTile(Module):
         # we will just use partial PoPE here
 
         assert dim_pope <= dim_keys
+
         self.pope = PoPE(dim = dim_pope, heads = heads) if use_pope else None
+        self.use_pope = use_pope
 
         # distance aware soft mask
 
@@ -265,6 +272,11 @@ class GatedScreeningTile(Module):
         queries, gates = queries_gates.split(self.dim_key_value, dim = -1)
         keys, values = keys_values.split(self.dim_key_value, dim = -1)
 
+        # if using pope, softplus queries and keys before l2norm
+
+        if self.use_pope:
+            queries, keys = map(F.softplus, (queries, keys))
+
         # aggressive normalization
 
         queries, keys, values = map(l2norm, (queries, keys, values)) # l2norm for queries, keys, and values
@@ -272,7 +284,7 @@ class GatedScreeningTile(Module):
         # maybe rotate
 
         if exists(self.pope):
-            queries, keys = self.pope.apply_pope_to_qk(pos_emb, queries, keys)
+            queries, keys = self.pope.apply_pope_to_qk(pos_emb, queries, keys, to_magnitude = identity)
 
         elif exists(pos_emb):
             assert exists(apply_pos_emb), f'`apply_pos_emb` function must be passed in, for your rotary or polar positional embeddings'
@@ -379,7 +391,7 @@ class MultiScreen(Module):
             dim_pope = dim_pope,
             dim_keys = dim_keys,
             dim_values = dim_values,
-            use_pope = False,
+            use_pope = True,
             competitive = layer_competitive,
             **kwargs
         ) for layer_competitive in competitive])
@@ -456,7 +468,7 @@ class MultiScreen(Module):
             block_out = layer(
                 tokens,
                 pos_emb = pos_emb,
-                apply_pos_emb = apply_pope_to_qk
+                apply_pos_emb = partial(apply_pope_to_qk, to_magnitude = identity)
             )
 
             tokens = tokens + orthog_project(block_out, tokens)
