@@ -57,7 +57,8 @@ def train(
     dim = 512,
     prime_length = 32,
     generate_length = 128,
-    generate_every = 500
+    generate_every = 500,
+    competitive = False
 ):
     # accelerators
 
@@ -73,7 +74,8 @@ def train(
         depth = depth,
         dim_keys = dim_keys,
         dim_values = dim_values,
-        dim_pope = dim_pope
+        dim_pope = dim_pope,
+        competitive = competitive
     )
 
     # prepare enwik8 data

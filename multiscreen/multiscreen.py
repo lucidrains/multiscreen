@@ -31,6 +31,9 @@ def inv_sqrt(x):
 def l2norm(t):
     return F.normalize(t, p = 2, dim = -1)
 
+def l1norm(t):
+    return F.normalize(t, p = 1, dim = -1)
+
 def init_normal_(t, scale = 0.1):
     dim = t.shape[-1]
     nn.init.normal_(t, std = scale * inv_sqrt(dim))
@@ -159,13 +162,15 @@ class GatedScreeningTile(Module):
         causal = True,
         distance_aware_soft_mask = True,
         depth_for_init = 6,
-        window_threshold = 256
+        window_threshold = 256,
+        competitive = False
     ):
         super().__init__()
         self.dim = dim
         self.heads = heads
         self.dim_keys = dim_keys
         self.dim_values = dim_values
+        self.competitive = competitive
         dim_context = default(dim_context, dim)
 
         # relative positions
@@ -294,11 +299,13 @@ class GatedScreeningTile(Module):
 
         if self.soft_mask:
             attn = self.soft_mask(attn)
-
         elif self.causal:
             i, j = attn.shape[-2:]
             causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
             attn = attn.masked_fill(causal_mask, 0.)
+
+        if self.competitive:
+            attn = l1norm(attn)
 
         # aggregate
 
@@ -335,6 +342,7 @@ class MultiScreen(Module):
         dim_pope = 4,
         dim_keys = 16,
         dim_values = 64,
+        competitive = False,
         **kwargs
     ):
         super().__init__()
@@ -360,6 +368,7 @@ class MultiScreen(Module):
             dim_keys = dim_keys,
             dim_values = dim_values,
             use_pope = False,
+            competitive = competitive,
             **kwargs
         ) for _ in range(depth)])
 
