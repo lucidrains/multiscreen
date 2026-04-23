@@ -52,6 +52,7 @@ def train(
     seq_len = 128,
     dim_keys = 32,
     dim_values = 64,
+    dim_pope = 8,
     depth = 6,
     dim = 512,
     prime_length = 32,
@@ -62,6 +63,8 @@ def train(
 
     accelerator = Accelerator()
 
+    print = accelerator.print
+
     # the multiscreen char language model
 
     model = MultiScreen(
@@ -69,7 +72,8 @@ def train(
         dim = dim,
         depth = depth,
         dim_keys = dim_keys,
-        dim_values = dim_values
+        dim_values = dim_values,
+        dim_pope = dim_pope
     )
 
     # prepare enwik8 data
@@ -121,7 +125,7 @@ def train(
 
             accelerator.backward(loss / grad_accum_every)
 
-        accelerator.print(f"training loss: {loss.item():.3f}")
+        print(f"training loss: {loss.item():.3f}")
 
         accelerator.clip_grad_norm_(model.parameters(), 0.5)
 
@@ -134,7 +138,7 @@ def train(
                 valid_data = next(val_loader)
 
                 loss = model(valid_data, return_loss = True)
-                accelerator.print(f"validation loss: {loss.item():.3f}")
+                print(f"validation loss: {loss.item():.3f}")
 
         if i % generate_every == 0:
             model.eval()
@@ -143,7 +147,7 @@ def train(
             inp = inp.to(accelerator.device)
 
             prime = decode_tokens(inp)
-            accelerator.print(f"\nINPUT: {prime}")
+            print(f"\nINPUT: {prime}")
 
             prompt = inp[None, ...]
 
@@ -152,7 +156,7 @@ def train(
 
             base_decode_output = decode_tokens(sampled[0])
 
-            accelerator.print(f"\nOUTPUT: {base_decode_output}\n")
+            print(f"\nOUTPUT: {base_decode_output}\n")
 
 if __name__ == '__main__':
     fire.Fire(train)

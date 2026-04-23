@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Callable
 from math import log, ceil
 
 import torch
@@ -10,7 +11,7 @@ import einx
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
-from PoPE_pytorch import PoPE
+from PoPE_pytorch import PoPE, apply_pope_to_qk
 
 from discrete_continuous_embed_readout import ParameterlessReadout
 
@@ -154,7 +155,7 @@ class GatedScreeningTile(Module):
         dim_keys = 16,
         dim_values = 64,
         use_pope = True,
-        dim_pope = 4,
+        dim_pope = 8,
         causal = True,
         distance_aware_soft_mask = True,
         depth_for_init = 6,
@@ -213,10 +214,10 @@ class GatedScreeningTile(Module):
 
     @torch.no_grad()
     def init_(self):
-        heads, dim_key_value = self.heads, self.dim_key_value
+        heads = self.heads
 
-        q_w, g_w = self.to_queries_gates.weight.view(heads, sum(dim_key_value), -1).split(dim_key_value, dim = 1)
-        k_w, v_w = self.to_keys_values.weight.view(heads, sum(dim_key_value), -1).split(dim_key_value, dim = 1)
+        q_w, g_w = rearrange(self.to_queries_gates.weight, '(h o) ... -> h o ...', h = heads).split(self.dim_key_value, dim = 1)
+        k_w, v_w = rearrange(self.to_keys_values.weight, '(h o) ... -> h o ...', h = heads).split(self.dim_key_value, dim = 1)
 
         init_normal_(q_w)
         init_normal_(k_w)
@@ -232,7 +233,9 @@ class GatedScreeningTile(Module):
         self,
         tokens,
         context = None,
-        mask = None
+        mask = None,
+        pos_emb = None,
+        apply_pos_emb: Callable | None = None
     ):
         # support cross attention
 
@@ -265,6 +268,8 @@ class GatedScreeningTile(Module):
 
         if exists(self.pope):
             queries, keys = self.pope.apply_pope_to_qk(pos_emb, queries, keys)
+        elif exists(pos_emb):
+            queries, keys = apply_pos_emb(pos_emb, queries, keys)
 
         # cosine similarity
 
@@ -326,6 +331,10 @@ class MultiScreen(Module):
         num_tokens,
         dim,
         depth = 6,
+        heads = 8,
+        dim_pope = 4,
+        dim_keys = 16,
+        dim_values = 64,
         **kwargs
     ):
         super().__init__()
@@ -336,9 +345,23 @@ class MultiScreen(Module):
         self.scale_embed = LearnedScale()
         self.scale_unembed = LearnedScale(init_value = dim ** 0.5)
 
+        # relative positions with pope
+        # https://arxiv.org/abs/2509.10534
+
+        self.pope = PoPE(dim = dim_pope, heads = heads)
+
         # gated screens
 
-        self.layers = ModuleList([GatedScreeningTile(dim = dim, causal = True, depth_for_init = depth, **kwargs) for _ in range(depth)])
+        self.layers = ModuleList([GatedScreeningTile(
+            dim = dim,
+            causal = True,
+            depth_for_init = depth,
+            dim_pope = dim_pope,
+            dim_keys = dim_keys,
+            dim_values = dim_values,
+            use_pope = False,
+            **kwargs
+        ) for _ in range(depth)])
 
         # readout
 
@@ -401,10 +424,20 @@ class MultiScreen(Module):
 
         tokens = self.scale_embed(tokens)
 
+        # positions
+
+        seq_len = token_ids.shape[-1]
+        pos_emb = self.pope(seq_len)
+
         # deep learning
 
         for layer in self.layers:
-            block_out = layer(tokens)
+            block_out = layer(
+                tokens,
+                pos_emb = pos_emb,
+                apply_pos_emb = apply_pope_to_qk
+            )
+
             tokens = tokens + orthog_project(block_out, tokens)
 
         # norm
