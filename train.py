@@ -53,12 +53,14 @@ def train(
     dim_keys = 32,
     dim_values = 64,
     dim_pope = 8,
+    heads = 16,
     depth = 6,
     dim = 512,
     prime_length = 32,
     generate_length = 128,
     generate_every = 500,
-    competitive = False
+    competitive = False,
+    use_sugar = True
 ):
     # accelerators
 
@@ -71,11 +73,13 @@ def train(
     model = MultiScreen(
         num_tokens = 256,
         dim = dim,
+        heads = heads,
         depth = depth,
         dim_keys = dim_keys,
         dim_values = dim_values,
         dim_pope = dim_pope,
-        competitive = competitive
+        competitive = competitive,
+        use_sugar = use_sugar
     )
 
     # prepare enwik8 data

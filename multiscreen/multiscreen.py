@@ -105,6 +105,36 @@ class LearnedScale(Module):
 
         return t * scale
 
+# SUGAR with B-SiLU
+# Horuz et al. https://arxiv.org/abs/2505.22074
+
+class SugarBSiLU(Module):
+    # proposed SUGAR with B-SiLU section 3.1
+    # it was their best performing
+
+    def __init__(
+        self,
+        alpha = 1.67
+    ):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        α = self.alpha
+
+        relu_out = x.relu() # forward out is just a relu
+
+        if not self.training:
+            return relu_out
+
+        # eq (7) in paper
+
+        bsilu_out = (x + α) * x.sigmoid() - α / 2
+
+        # straight-through during training
+
+        return bsilu_out + (relu_out - bsilu_out).detach()
+
 # distance aware soft mask
 
 class SoftMask(Module):
@@ -168,7 +198,8 @@ class GatedScreeningTile(Module):
         distance_aware_soft_mask = True,
         depth_for_init = 6,
         window_threshold = 256,
-        competitive = False
+        competitive = False,
+        use_sugar = True
     ):
         super().__init__()
         self.dim = dim
@@ -214,6 +245,10 @@ class GatedScreeningTile(Module):
 
         self.inverse_acceptance_width = LearnedScale(heads, bias = 1., rearrange_eq = 'h -> h 1 1') # r in paper, as r increases, you filter / screen out less
         self.head_wise_scale = LearnedScale(heads, rearrange_eq = 'h -> h 1 1', init_value = inv_sqrt(heads * depth_for_init))
+
+        # sugar bsilu
+
+        self.activation = SugarBSiLU() if use_sugar else nn.ReLU()
 
         # split and merging of heads
 
@@ -302,9 +337,9 @@ class GatedScreeningTile(Module):
 
         screened_sim = 1. - r * (1. - sim) # eq (16)
 
-        # relu squared
+        # relu or sugar squared
 
-        attn = F.relu(screened_sim) ** 2
+        attn = self.activation(screened_sim) ** 2
 
         # maybe mask
 
@@ -359,6 +394,7 @@ class MultiScreen(Module):
         dim_keys = 16,
         dim_values = 64,
         competitive: bool | tuple[bool, ...] = False,
+        use_sugar = False,
         **kwargs
     ):
         super().__init__()
@@ -393,6 +429,7 @@ class MultiScreen(Module):
             dim_values = dim_values,
             use_pope = True,
             competitive = layer_competitive,
+            use_sugar = use_sugar,
             **kwargs
         ) for layer_competitive in competitive])
 

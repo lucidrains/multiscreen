@@ -63,3 +63,15 @@ $ uv run train.py
     primaryClass = {cs.CL}
 }
 ```
+
+```bibtex
+@misc{horuz2025resurrectionrelu,
+    title   = {The Resurrection of the ReLU},
+    author  = {Coşku Can Horuz and Geoffrey Kasenbacher and Saya Higuchi and Sebastian Kairat and Jendrik Stoltz and Moritz Pesl and Bernhard A. Moser and Christoph Linse and Thomas Martinetz and Sebastian Otte},
+    year    = {2025},
+    eprint  = {2505.22074},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2505.22074},
+}
+```
