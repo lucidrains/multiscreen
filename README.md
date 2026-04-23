@@ -33,6 +33,12 @@ logits = multi_screen(token_ids)
 assert logits.shape == (1, 1024, 256)
 ```
 
+## Enwik8
+
+```bash
+$ uv run train.py
+```
+
 ## Citations
 
 ```bibtex

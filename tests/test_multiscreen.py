@@ -29,5 +29,11 @@ def test_multiscreen():
 
     token_ids = torch.randint(0, 256, (1, 128))
 
+    loss = model(token_ids, return_loss = True)
+    loss.backward()
+
     logits = model(token_ids)
     assert logits.shape == (1, 128, 256)
+
+    generated = model.generate(token_ids[..., :1], seq_len = 3)
+    assert generated.shape[-1] == 2

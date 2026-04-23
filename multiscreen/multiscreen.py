@@ -1,16 +1,18 @@
 from __future__ import annotations
-from math import log
+from math import log, ceil
 
 import torch
-from torch import nn, pi, arange
+from torch import nn, pi, arange, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear
 
 import einx
-from einops import einsum
+from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
 from PoPE_pytorch import PoPE
+
+from discrete_continuous_embed_readout import ParameterlessReadout
 
 # functions
 
@@ -20,10 +22,30 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def inv_sqrt(x):
+    return x ** -0.5
+
 # tensor helpers
 
 def l2norm(t):
     return F.normalize(t, p = 2, dim = -1)
+
+def init_normal_(t, scale = 0.1):
+    dim = t.shape[-1]
+    nn.init.normal_(t, std = scale * inv_sqrt(dim))
+
+# simple sampling filter
+
+def top_k(logits, frac_num_tokens = 0.1, k = None):
+    num_tokens = logits.shape[-1]
+
+    k = default(k, ceil(frac_num_tokens * num_tokens))
+    k = min(k, num_tokens)
+
+    value, indices = logits.topk(k)
+    probs = torch.full_like(logits, float('-inf'))
+    probs.scatter_(-1, indices, value)
+    return probs
 
 # orthogonal residual updates
 # https://arxiv.org/abs/2505.11881
@@ -79,10 +101,18 @@ class LearnedScale(Module):
 class SoftMask(Module):
     def __init__(
         self,
-        heads
+        heads,
+        window_threshold = 256
     ):
         super().__init__()
+        self.heads = heads
+        self.window_threshold = window_threshold
         self.learned_window = LearnedScale(heads, bias = 1., rearrange_eq = 'h -> h 1 1')
+
+    @torch.no_grad()
+    def init_(self):
+        log_scales_init = torch.linspace(0., log(self.window_threshold), self.heads)
+        self.learned_window.log_scales.copy_(log_scales_init)
 
     def forward(
         self,
@@ -126,9 +156,15 @@ class GatedScreeningTile(Module):
         use_pope = True,
         dim_pope = 4,
         causal = True,
-        distance_aware_soft_mask = True
+        distance_aware_soft_mask = True,
+        depth_for_init = 6,
+        window_threshold = 256
     ):
         super().__init__()
+        self.dim = dim
+        self.heads = heads
+        self.dim_keys = dim_keys
+        self.dim_values = dim_values
         dim_context = default(dim_context, dim)
 
         # relative positions
@@ -136,11 +172,11 @@ class GatedScreeningTile(Module):
         # we will just use partial PoPE here
 
         assert dim_pope <= dim_keys
-        self.pope = PoPE(dim = dim_pope, heads = heads) if exists(use_pope) else None
+        self.pope = PoPE(dim = dim_pope, heads = heads) if use_pope else None
 
         # distance aware soft mask
 
-        self.soft_mask = SoftMask(heads) if distance_aware_soft_mask else None
+        self.soft_mask = SoftMask(heads, window_threshold = window_threshold) if distance_aware_soft_mask else None
 
         # autoregressive or not
 
@@ -164,12 +200,31 @@ class GatedScreeningTile(Module):
         # learned parameters for screening and headwise scale at end
 
         self.inverse_acceptance_width = LearnedScale(heads, bias = 1., rearrange_eq = 'h -> h 1 1') # r in paper, as r increases, you filter / screen out less
-        self.head_wise_scale = LearnedScale(heads, rearrange_eq = 'h -> h 1 1')
+        self.head_wise_scale = LearnedScale(heads, rearrange_eq = 'h -> h 1 1', init_value = inv_sqrt(heads * depth_for_init))
 
         # split and merging of heads
 
         self.split_heads = Rearrange('... n (h d) -> ... h n d', h = heads)
         self.merge_heads = Rearrange('... h n d -> ... n (h d)')
+
+        # init
+
+        self.init_()
+
+    @torch.no_grad()
+    def init_(self):
+        q_w, g_w = self.to_queries_gates.weight.view(self.heads, self.dim_keys + self.dim_values, -1).split([self.dim_keys, self.dim_values], dim = 1)
+        init_normal_(q_w)
+        nn.init.normal_(g_w, std = 0.1)
+
+        k_w, v_w = self.to_keys_values.weight.view(self.heads, self.dim_keys + self.dim_values, -1).split([self.dim_keys, self.dim_values], dim = 1)
+        init_normal_(k_w)
+        init_normal_(v_w)
+
+        init_normal_(self.to_out.weight)
+
+        if exists(self.soft_mask):
+            self.soft_mask.init_()
 
     def forward(
         self,
@@ -272,18 +327,71 @@ class MultiScreen(Module):
         **kwargs
     ):
         super().__init__()
+        self.dim = dim
 
         self.token_embeds = nn.Parameter(torch.randn(num_tokens, dim) * 1e-2)
 
         self.scale_embed = LearnedScale()
-        self.scale_unembed = LearnedScale()
+        self.scale_unembed = LearnedScale(init_value = dim ** 0.5)
 
         # gated screens
 
-        self.layers = ModuleList([GatedScreeningTile(dim = dim, **kwargs) for _ in range(depth)])
+        self.layers = ModuleList([GatedScreeningTile(dim = dim, causal = True, depth_for_init = depth, **kwargs) for _ in range(depth)])
 
-    def forward(self, token_ids):
+        # readout
 
+        self.readout = ParameterlessReadout(num_discrete = 1)
+
+        # init
+
+        self.init_()
+
+    @torch.no_grad()
+    def init_(self):
+        init_normal_(self.token_embeds)
+
+        for layer in self.layers:
+            layer.init_()
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt,
+        seq_len,
+        temperature = 1.,
+        filter_fn = top_k,
+        filter_kwargs: dict = dict()
+    ):
+        prompt_len = prompt.shape[-1]
+
+        assert seq_len > prompt_len
+        generate_len = seq_len - prompt_len
+
+        out = prompt
+
+        for _ in range(generate_len):
+            logits = self.forward(out)
+
+            last_logits = logits[:, -1:]
+            filtered_logits = filter_fn(last_logits, **filter_kwargs)
+
+            sampled = self.readout.sample(filtered_logits, temperature = temperature)
+
+            out = cat((out, sampled), dim = -1)
+
+        return out[..., prompt_len:]
+
+    def forward(
+        self,
+        token_ids,
+        return_loss = False
+    ):
+
+        # returning autoregressive loss
+
+        if return_loss:
+            token_ids, labels = token_ids[..., :-1], token_ids[..., 1:]
+        
         # embed
 
         normed_token_embeds = l2norm(self.token_embeds)
@@ -294,9 +402,8 @@ class MultiScreen(Module):
         # deep learning
 
         for layer in self.layers:
-            residual = tokens
             block_out = layer(tokens)
-            tokens = tokens + orthog_project(block_out, residual)
+            tokens = tokens + orthog_project(block_out, tokens)
 
         # norm
 
@@ -307,4 +414,14 @@ class MultiScreen(Module):
         tokens = self.scale_unembed(tokens)
         logits = einsum(tokens, normed_token_embeds, 'b n d, l d -> b n l')
 
-        return logits
+        # returning logits only
+
+        if not return_loss:
+            return logits
+
+        loss = F.cross_entropy(
+            rearrange(logits, 'b n l -> b l n'),
+            labels
+        )
+
+        return loss
