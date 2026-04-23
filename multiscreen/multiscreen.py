@@ -306,6 +306,8 @@ class GatedScreeningTile(Module):
             causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
             attn = attn.masked_fill(causal_mask, 0.)
 
+        # maybe competitive
+
         if self.competitive:
             attn = l1norm(attn)
 
@@ -344,7 +346,7 @@ class MultiScreen(Module):
         dim_pope = 4,
         dim_keys = 16,
         dim_values = 64,
-        competitive = False,
+        competitive: bool | tuple[bool, ...] = False,
         **kwargs
     ):
         super().__init__()
@@ -360,6 +362,13 @@ class MultiScreen(Module):
 
         self.pope = PoPE(dim = dim_pope, heads = heads)
 
+        # per-layer competitive flags
+
+        if isinstance(competitive, bool):
+            competitive = (competitive,) * depth
+
+        assert len(competitive) == depth, f'competitive tuple length {len(competitive)} must match depth {depth}'
+
         # gated screens
 
         self.layers = ModuleList([GatedScreeningTile(
@@ -371,9 +380,9 @@ class MultiScreen(Module):
             dim_keys = dim_keys,
             dim_values = dim_values,
             use_pope = False,
-            competitive = competitive,
+            competitive = layer_competitive,
             **kwargs
-        ) for _ in range(depth)])
+        ) for layer_competitive in competitive])
 
         # readout
 
