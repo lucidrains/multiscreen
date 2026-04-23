@@ -273,7 +273,9 @@ class GatedScreeningTile(Module):
 
         if exists(self.pope):
             queries, keys = self.pope.apply_pope_to_qk(pos_emb, queries, keys)
+
         elif exists(pos_emb):
+            assert exists(apply_pos_emb), f'`apply_pos_emb` function must be passed in, for your rotary or polar positional embeddings'
             queries, keys = apply_pos_emb(pos_emb, queries, keys)
 
         # cosine similarity
@@ -362,6 +364,7 @@ class MultiScreen(Module):
 
         self.layers = ModuleList([GatedScreeningTile(
             dim = dim,
+            heads = heads,
             causal = True,
             depth_for_init = depth,
             dim_pope = dim_pope,
