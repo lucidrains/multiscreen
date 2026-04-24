@@ -52,9 +52,8 @@ def train(
     seq_len = 128,
     dim_keys = 32,
     dim_values = 64,
-    dim_pope = 8,
     heads = 16,
-    depth = 6,
+    depth = 12,
     dim = 512,
     prime_length = 32,
     generate_length = 128,
@@ -77,7 +76,6 @@ def train(
         depth = depth,
         dim_keys = dim_keys,
         dim_values = dim_values,
-        dim_pope = dim_pope,
         competitive = competitive,
         use_sugar = use_sugar
     )

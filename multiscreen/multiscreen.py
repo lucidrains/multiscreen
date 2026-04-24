@@ -13,8 +13,6 @@ import einx
 from einops import einsum, rearrange
 from einops.layers.torch import Rearrange
 
-from PoPE_pytorch import PoPE, apply_pope_to_qk
-
 from discrete_continuous_embed_readout import ParameterlessReadout
 
 # functions
@@ -33,14 +31,17 @@ def inv_sqrt(x):
 
 # tensor helpers
 
+def arange_like(n, t):
+    return arange(n, device = t.device, dtype = t.dtype)
+
 def l2norm(t):
     return F.normalize(t, p = 2, dim = -1)
 
 def l1norm(t):
     return F.normalize(t, p = 1, dim = -1)
 
-def init_normal_(t, scale = 0.1):
-    dim = t.shape[-1]
+def init_normal_(t, dim = None, scale = 0.1):
+    dim = default(dim, t.shape[1])
     nn.init.normal_(t, std = scale * inv_sqrt(dim))
 
 # simple sampling filter
@@ -76,6 +77,23 @@ def orthog_project(x, y):
 def tanh_norm(t):
     norm = t.norm(dim = -1, keepdim = True)
     return norm.tanh() * l2norm(t)
+
+# rotary embeddings
+
+def apply_mipe(freqs, t):
+    to_rotate, rest = t[..., :2], t[..., 2:]
+    x0, x1 = to_rotate[..., 0:1], to_rotate[..., 1:2]
+
+    seq_len = t.shape[-2]
+    freqs_match = freqs[..., -seq_len:, :]
+    cos, sin = freqs_match.cos(), freqs_match.sin()
+
+    rotated = cat((
+        x0 * cos - x1 * sin,
+        x0 * sin + x1 * cos
+    ), dim = -1)
+
+    return cat((rotated, rest), dim = -1)
 
 # learned scales
 
@@ -141,11 +159,13 @@ class SoftMask(Module):
     def __init__(
         self,
         heads,
-        window_threshold = 256
+        window_threshold = 256,
+        causal = True
     ):
         super().__init__()
         self.heads = heads
         self.window_threshold = window_threshold
+        self.causal = causal
         self.learned_window = LearnedScale(heads, bias = 1., rearrange_eq = 'h -> h 1 1')
 
     @torch.no_grad()
@@ -157,7 +177,7 @@ class SoftMask(Module):
         self,
         sim
     ):
-        i, j, device = *sim.shape[2:], sim.device
+        i, j = sim.shape[2:]
         offset = j - i
 
         assert i <= j
@@ -168,14 +188,16 @@ class SoftMask(Module):
 
         # get distance
 
-        seq_i, seq_j = tuple(arange(n, dtype = torch.float, device = device) for n in (i, j))
+        seq_i, seq_j = tuple(arange_like(n, sim) for n in (i, j))
 
         distance = einx.subtract('j, i -> i j', seq_j, seq_i + offset)
 
         # eq (17)
 
+        mask_cond = (distance <= 0.) & (distance > -w) if self.causal else (distance < w) & (distance > -w)
+
         soft_mask = torch.where(
-            (distance <= 0.) & (distance > -w),
+            mask_cond,
             0.5 * (torch.cos((distance * pi) / w) + 1.),
             0.
         )
@@ -192,8 +214,7 @@ class GatedScreeningTile(Module):
         dim_context = None,
         dim_keys = 16,
         dim_values = 64,
-        use_pope = True,
-        dim_pope = 8,
+        use_mipe = True,
         causal = True,
         distance_aware_soft_mask = True,
         depth_for_init = 6,
@@ -210,17 +231,15 @@ class GatedScreeningTile(Module):
         dim_context = default(dim_context, dim)
 
         # relative positions
-        # author overly concerned with length extrap, seems unaware of recent work https://arxiv.org/abs/2509.10534
-        # we will just use partial PoPE here
+        # paper uses MiPE (minimal positional encoding), a window-adaptive RoPE applied to first 2 coordinates
 
-        assert dim_pope <= dim_keys
-
-        self.pope = PoPE(dim = dim_pope, heads = heads) if use_pope else None
-        self.use_pope = use_pope
+        self.use_mipe = use_mipe
 
         # distance aware soft mask
 
-        self.soft_mask = SoftMask(heads, window_threshold = window_threshold) if distance_aware_soft_mask else None
+        distance_aware_soft_mask |= use_mipe
+
+        self.soft_mask = SoftMask(heads, window_threshold = window_threshold, causal = causal) if distance_aware_soft_mask else None
 
         # autoregressive or not
 
@@ -269,7 +288,7 @@ class GatedScreeningTile(Module):
         init_normal_(q_w)
         init_normal_(k_w)
         init_normal_(v_w)
-        init_normal_(self.to_out.weight)
+        init_normal_(self.to_out.weight, dim = self.dim)
 
         nn.init.normal_(g_w, std = 0.1)
 
@@ -288,12 +307,6 @@ class GatedScreeningTile(Module):
 
         key_value_input = default(context, tokens)
 
-        # maybe pope
-
-        if exists(self.pope):
-            seq_len = max((key_value_input.shape[-2], tokens.shape[-2]))
-            pos_emb = self.pope(seq_len)
-
         # queries, keys, values
 
         queries_gates = self.to_queries_gates(tokens)
@@ -307,22 +320,35 @@ class GatedScreeningTile(Module):
         queries, gates = queries_gates.split(self.dim_key_value, dim = -1)
         keys, values = keys_values.split(self.dim_key_value, dim = -1)
 
-        # if using pope, softplus queries and keys before l2norm
-
-        if self.use_pope:
-            queries, keys = map(F.softplus, (queries, keys))
-
         # aggressive normalization
 
         queries, keys, values = map(l2norm, (queries, keys, values)) # l2norm for queries, keys, and values
 
         # maybe rotate
 
-        if exists(self.pope):
-            queries, keys = self.pope.apply_pope_to_qk(pos_emb, queries, keys, to_magnitude = identity)
+        if self.use_mipe and exists(self.soft_mask):
+            w = rearrange(self.soft_mask.learned_window(), 'h 1 1 -> h')
+            w_th = self.soft_mask.window_threshold
+
+            gamma = torch.where(
+                w < w_th,
+                0.5 * (torch.cos(pi * w / w_th) + 1.),
+                0.
+            )
+
+            freq = pi * gamma / w
+
+            seq_len = max((key_value_input.shape[-2], tokens.shape[-2]))
+            pos = arange_like(seq_len, tokens)
+
+            mipe_pos_emb = einsum(freq, pos, 'h, n -> h n')
+            mipe_pos_emb = rearrange(mipe_pos_emb, 'h n -> 1 h n 1')
+
+            queries = apply_mipe(mipe_pos_emb, queries)
+            keys = apply_mipe(mipe_pos_emb, keys)
 
         elif exists(pos_emb):
-            assert exists(apply_pos_emb), f'`apply_pos_emb` function must be passed in, for your rotary or polar positional embeddings'
+            assert exists(apply_pos_emb), f'`apply_pos_emb` function must be passed in, for your positional embeddings'
             queries, keys = apply_pos_emb(pos_emb, queries, keys)
 
         # cosine similarity
@@ -346,7 +372,7 @@ class GatedScreeningTile(Module):
         if exists(mask):
             attn = einx.where('b j, b h i j,', mask, attn, 0.)
 
-        if self.soft_mask:
+        if exists(self.soft_mask):
             attn = self.soft_mask(attn)
         elif self.causal:
             i, j = attn.shape[-2:]
@@ -390,7 +416,6 @@ class MultiScreen(Module):
         dim,
         depth = 6,
         heads = 8,
-        dim_pope = 4,
         dim_keys = 16,
         dim_values = 64,
         competitive: bool | tuple[bool, ...] = False,
@@ -404,11 +429,6 @@ class MultiScreen(Module):
 
         self.scale_embed = LearnedScale()
         self.scale_unembed = LearnedScale(init_value = dim ** 0.5)
-
-        # relative positions with pope
-        # https://arxiv.org/abs/2509.10534
-
-        self.pope = PoPE(dim = dim_pope, heads = heads)
 
         # per-layer competitive flags
 
@@ -424,10 +444,9 @@ class MultiScreen(Module):
             heads = heads,
             causal = True,
             depth_for_init = depth,
-            dim_pope = dim_pope,
             dim_keys = dim_keys,
             dim_values = dim_values,
-            use_pope = True,
+            use_mipe = True,
             competitive = layer_competitive,
             use_sugar = use_sugar,
             **kwargs
@@ -494,20 +513,10 @@ class MultiScreen(Module):
 
         tokens = self.scale_embed(tokens)
 
-        # positions
-
-        seq_len = token_ids.shape[-1]
-        pos_emb = self.pope(seq_len)
-
         # deep learning
 
         for layer in self.layers:
-            block_out = layer(
-                tokens,
-                pos_emb = pos_emb,
-                apply_pos_emb = partial(apply_pope_to_qk, to_magnitude = identity)
-            )
-
+            block_out = layer(tokens)
             tokens = tokens + orthog_project(block_out, tokens)
 
         # norm
