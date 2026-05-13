@@ -1,11 +1,10 @@
 from __future__ import annotations
 from typing import Callable
 
-from functools import partial
 from math import log, ceil
 
 import torch
-from torch import nn, pi, arange, cat
+from torch import nn, pi, arange, cat, tensor
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear
 
@@ -22,9 +21,6 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
-
-def identity(t):
-    return t
 
 def inv_sqrt(x):
     return x ** -0.5
@@ -166,12 +162,25 @@ class SoftMask(Module):
         self.heads = heads
         self.window_threshold = window_threshold
         self.causal = causal
+
         self.learned_window = LearnedScale(heads, bias = 1., rearrange_eq = 'h -> h 1 1')
+        self.register_buffer('max_seq_len', tensor(0).long())
 
     @torch.no_grad()
     def init_(self):
         log_scales_init = torch.linspace(0., log(self.window_threshold), self.heads)
         self.learned_window.log_scales.copy_(log_scales_init)
+
+    @property
+    def effective_window(self):
+        w = self.learned_window()
+
+        if self.training or self.max_seq_len.item() == 0:
+            return w
+
+        # section 3.2 - during inference, set w = inf when learned window exceeds max training seq len
+
+        return torch.where(w > self.max_seq_len, float('inf'), w)
 
     def forward(
         self,
@@ -182,9 +191,10 @@ class SoftMask(Module):
 
         assert i <= j
 
-        # learned window
+        if self.training:
+            self.max_seq_len.clamp_(min = j)
 
-        w = self.learned_window()
+        w = self.effective_window
 
         # get distance
 
@@ -327,7 +337,7 @@ class GatedScreeningTile(Module):
         # maybe rotate
 
         if self.use_mipe and exists(self.soft_mask):
-            w = rearrange(self.soft_mask.learned_window(), 'h 1 1 -> h')
+            w = rearrange(self.soft_mask.effective_window, 'h 1 1 -> h')
             w_th = self.soft_mask.window_threshold
 
             gamma = torch.where(
@@ -420,6 +430,8 @@ class MultiScreen(Module):
         dim_values = 64,
         competitive: bool | tuple[bool, ...] = False,
         use_sugar = False,
+        final_norm = False,
+        orthog_residual = False,
         **kwargs
     ):
         super().__init__()
@@ -455,6 +467,11 @@ class MultiScreen(Module):
         # readout
 
         self.readout = ParameterlessReadout(num_discrete = 1)
+
+        # flags
+
+        self.final_norm = final_norm
+        self.orthog_residual = orthog_residual
 
         # init
 
@@ -517,11 +534,16 @@ class MultiScreen(Module):
 
         for layer in self.layers:
             block_out = layer(tokens)
-            tokens = tokens + orthog_project(block_out, tokens)
+
+            if self.orthog_residual:
+                block_out = orthog_project(block_out, tokens)
+
+            tokens = tokens + block_out
 
         # norm
 
-        tokens = l2norm(tokens)
+        if self.final_norm:
+            tokens = l2norm(tokens)
 
         # unembed
 
